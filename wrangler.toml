@@ -12,4 +12,8 @@ binding = "ASSETS"
 
 [[kv_namespaces]]
 binding = "SAVES"
-id = "440bbbf1d5a34352a15c44654f23240e"
+id = "4c7cc128ecdc43b185c678bc80a07c02"
+
+[[r2_buckets]]
+binding = "GAME"
+bucket_name = "gta-vc-assets"

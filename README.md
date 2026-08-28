@@ -313,19 +313,47 @@ npx wrangler r2 bucket create gta-vc-assets
 
 ### 3.5 Load the game assets into R2
 
-The project ships every asset in one packed archive, independent of any CDN. It is about 1.01 GiB, so start the download before you do anything else.
+The project ships every asset in one packed archive, independent of any CDN. It is about 1.01 GiB and expands to roughly 1.6 GB across 31,000 files.
+
+**Download the archive to disk first, then unpack it. Do not unpack straight from the URL.** `utils/packer_brotli.py` has two unpack paths, and only the local-file one is correct: it honours a per-file "stored as-is" flag so that already-Brotli files are written back untouched. The streaming path used for URLs ignores that flag and decompresses everything, leaving `vcbr/*.br` as plain data still named `.br`. Every layer downstream keys `Content-Encoding` off that extension, so the server then advertises Brotli on bytes that aren't, the browser's decoder fails, and the game hangs forever on "Downloading..." with a 200 in the server log.
+
+From your repo root:
 
 ```bash
 conda create -n revc python=3.11 -y
 conda activate revc
 pip install -r requirements.txt
-python server.py --unpacked https://folder.morgen.qzz.io/revcdos.bin
-python server.py --unpacked https://folder.morgen.qzz.io/revcdos.bin
+curl -L -o revcdos.bin https://folder.morgen.qzz.io/revcdos.bin
+python server.py --unpacked revcdos.bin
 ```
 
-This streams and unpacks simultaneously into `unpacked/{md5}/`, containing `vcsky/` and `vcbr/` subdirectories, then starts a local server. **Play it at `http://localhost:8000` before going further** — that proves the assets are intact and separates any later problem from the assets themselves. Then `Ctrl-C`.
+The output should show `stored as-is (.br)` for the four `vcbr` files and a roughly `1.0x` ratio on that line. A `2.3x` expansion there means you took the streaming path and the files are wrong.
 
-Note what the unpacker produces, because the Worker depends on it: files under `vcbr/` keep their `.br` extension and stay Brotli-compressed, while everything under `vcsky/` is written out decompressed.
+**Verify by testing the bytes, not the filename.** The failure mode leaves valid-looking files with the right names, so check them directly:
+
+```bash
+du -sh unpacked/*/vcbr/     # ~122 MB, not ~285 MB
+
+python -c "
+import glob, brotli
+for f in sorted(glob.glob('unpacked/*/vcbr/*.br')):
+    head = open(f,'rb').read(4096)
+    try:
+        brotli.Decompressor().process(head); print('brotli OK   ', f)
+    except Exception:
+        print('NOT brotli  ', f)
+"
+```
+
+Four `brotli OK` lines means you are good. Anything else, delete that unpacked directory and redo this step.
+
+**Where the files land.** The directory name is the MD5 of the *source string* you passed, not of the archive contents. So `revcdos.bin` always unpacks to `unpacked/d387c6f45d823194bc47671214496367/`, while the URL form produces a different directory. Two consequences: a failed attempt from the URL leaves its own tree behind that you should delete to reclaim the space, and re-running the same command reuses the existing directory without re-unpacking.
+
+That directory holds `vcsky/` and `vcbr/` subdirectories, and the server starts once unpacking finishes. **Play it at `http://localhost:8000` before going further** — that proves the assets are intact and separates any later problem from the assets themselves. Then `Ctrl-C`.
+
+What you should end up with, and what the Worker depends on: files under `vcbr/` keep their `.br` extension and stay Brotli-compressed, while everything under `vcsky/` is written out decompressed.
+
+Keep `revcdos.bin` when you're done. With the DOS Zone buckets closed, that archive is your only copy of the assets, and the mirror it came from is one person's file host with no guarantees. Store a copy somewhere off the laptop.
 
 Uploading a few thousand files one at a time with `wrangler r2 object put` would take hours, so use rclone:
 
@@ -344,11 +372,11 @@ rclone config create r2 s3 \
   region=auto \
   no_check_bucket=true
 
-cd ~/GTA-VC/unpacked/<md5>
+cd unpacked/d387c6f45d823194bc47671214496367
 rclone copy . r2:gta-vc-assets/ --progress --transfers 16 --checksum
 ```
 
-The `vcsky/` and `vcbr/` directory names become the R2 key prefixes the Worker looks up, so copy the contents of the `{md5}` directory, not the directory itself. Verify when it finishes:
+The `vcsky/` and `vcbr/` directory names become the R2 key prefixes the Worker looks up, so copy the *contents* of that directory, not the directory itself. Note the trailing `.` — `rclone copy . r2:gta-vc-assets/` is what produces keys like `vcbr/vc-sky-en-v6.data.br`. Verify when it finishes:
 
 ```bash
 npx wrangler r2 object get gta-vc-assets/vcbr/vc-sky-en-v6.wasm.br --file=/tmp/check.br
@@ -510,6 +538,7 @@ Then in a browser: load the site, enter a 5-character key, check the status goes
 | Same error, but the body is not XML | Body double-encoded | Confirm `encodeBody: "manual"` is on the R2 response |
 | Assets 404 through the Worker | Wrong key prefixes in the bucket | `npx wrangler r2 object get gta-vc-assets/vcsky/sha256sums.txt --file=-` |
 | Fixed the server, still broken in the browser | Corrupt payload cached by `loadData()` | Private window, or Application → Storage → Clear site data |
+| Stuck on "Downloading..." forever, server logs 200 | `.br` files decompressed by the streaming unpacker | `du -sh unpacked/*/vcbr/` — if ~285 MB, re-unpack from a local `.bin` |
 | Saves don't sync across devices | No key entered, or different key | Same 5 characters on both, status green |
 | `Authentication error [code: 10000]` locally | OAuth credentials expired or revoked | `npx wrangler logout` then `npx wrangler login` |
 | Deployed to the wrong Cloudflare account | Logged in as a different account | `npx wrangler whoami`, then re-login |
@@ -591,3 +620,15 @@ The `preCommands: npm ci` step installs the Wrangler version pinned in your `pac
 ### B.4 Rotating or revoking
 
 Tokens are independent, so this is cheap to redo. Cloudflare dashboard → **Account API tokens** → **Roll** to issue a new value, or **Delete** to kill it outright, then update the GitHub secret. If a token ever leaks, delete it first and create a fresh one rather than trying to narrow its scope.
+
+---
+
+## Appendix C: known bugs in the upstream project
+
+Both of these cost real debugging time and neither produces a useful error message. Worth a PR to `Lolendor/reVCDOS`.
+
+**1. The README understates the Python requirement.** It advertises Python 3.8+, but `additions/cache.py` line 30 annotates a return type as `FileResponse | StreamingResponse | None`, which is PEP 604 syntax requiring 3.10+. It is the only such line in the codebase. Docker users never see it because the Dockerfile pins `python:3.11-slim`. The failure is `TypeError: unsupported operand type(s) for |` at import.
+
+**2. `--unpacked <url>` silently corrupts the Brotli assets.** In `utils/packer_brotli.py`, `unpack_file_async()` branches on the per-file `is_precompressed` flag and writes `.br` files back untouched. The streaming path used for URLs, `stream_unpack()`, calls `file_chunk_generator_decompressed` unconditionally and has no equivalent check, so already-Brotli files get expanded while keeping their `.br` names.
+
+Nothing downstream notices, because every layer trusts the extension. `additions/cache.py` sets `Content-Encoding: br` from the suffix, the browser's decoder then fails on non-Brotli bytes, and `loadData()` in `game.js` never checks `response.ok` or catches the stream error. The visible result is a game stuck on "Downloading..." forever while the server logs a clean `200 OK`. Downloading the archive first and unpacking from the local file avoids the broken path entirely.

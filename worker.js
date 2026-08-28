@@ -1,12 +1,9 @@
 // gta-vc — replaces server.py / index.php on Cloudflare Workers.
-//   /vcsky/*, /vcbr/*  → proxied to the DOS Zone CDN (game.js expects same-origin paths)
+//   /vcsky/*, /vcbr/*  → game assets from your R2 bucket (game.js expects same-origin paths)
 //   /token/get, /saves/*  → self-hosted saves, backed by Workers KV
 //   everything else     → served from dist/ as a static asset (free, unmetered)
 
-const UPSTREAM = {
-  "/vcsky/": "https://cdn.dos.zone/vcsky/",
-  "/vcbr/": "https://br.cdn.dos.zone/vcsky/",
-};
+const R2_PREFIXES = { "/vcsky/": "vcsky/", "/vcbr/": "vcbr/" };
 
 const MAX_SAVE_BYTES = 4 * 1024 * 1024;
 const safe = (s) => typeof s === "string" && /^[\w.-]{1,64}$/.test(s);
@@ -14,7 +11,7 @@ const safe = (s) => typeof s === "string" && /^[\w.-]{1,64}$/.test(s);
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const { pathname, search } = url;
+    const { pathname } = url;
 
     // --- saves ---------------------------------------------------------
 
@@ -64,12 +61,21 @@ export default {
 
     // --- game assets ---------------------------------------------------
 
-    for (const [prefix, base] of Object.entries(UPSTREAM)) {
+    for (const [prefix, keyBase] of Object.entries(R2_PREFIXES)) {
       if (pathname.startsWith(prefix)) {
-        const target = base + pathname.slice(prefix.length) + search;
-        return fetch(new Request(target, request), {
-          cf: { cacheEverything: true },
-        });
+        const key = keyBase + decodeURIComponent(pathname.slice(prefix.length));
+        if (key.includes("..")) return new Response("bad request", { status: 400 });
+
+        const object = await env.GAME.get(key);
+        if (!object) return new Response("not found", { status: 404 });
+
+        const headers = new Headers();
+        object.writeHttpMetadata(headers);
+        headers.set("etag", object.httpEtag);
+        headers.set("cache-control", "public, max-age=31536000, immutable");
+        if (key.endsWith(".br")) headers.set("content-encoding", "br");
+
+        return new Response(object.body, { headers, encodeBody: "manual" });
       }
     }
 

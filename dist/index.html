@@ -697,7 +697,7 @@
 
     <script type='text/javascript' src="GamepadEmulator.js"></script>
     <script>
-        if (new URLSearchParams(window.location.search).get("custom_saves") === "1") {
+        if (new URLSearchParams(window.location.search).get("custom_saves") !== "0") {
             document.write('<script src="jsdos-cloud-sdk-local.js"><\/script>');
         } else {
             document.write('<script src="jsdos-cloud-sdk.js"><\/script>');

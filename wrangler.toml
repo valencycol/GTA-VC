@@ -1,0 +1,15 @@
+name = "gta-vc"
+main = "worker.js"
+compatibility_date = "2026-08-28"
+
+routes = [
+  { pattern = "gta-vc.colaco.se", custom_domain = true }
+]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+[[kv_namespaces]]
+binding = "SAVES"
+id = "440bbbf1d5a34352a15c44654f23240e"

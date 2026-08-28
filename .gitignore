@@ -9,3 +9,6 @@ vcsky/
 saves/
 unpacked/
 *.bin
+
+node_modules/
+.wrangler/

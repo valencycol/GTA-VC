@@ -316,8 +316,10 @@ npx wrangler r2 bucket create gta-vc-assets
 The project ships every asset in one packed archive, independent of any CDN. It is about 1.01 GiB, so start the download before you do anything else.
 
 ```bash
-cd ~/GTA-VC
+conda create -n revc python=3.11 -y
+conda activate revc
 pip install -r requirements.txt
+python server.py --unpacked https://folder.morgen.qzz.io/revcdos.bin
 python server.py --unpacked https://folder.morgen.qzz.io/revcdos.bin
 ```
 

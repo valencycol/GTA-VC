@@ -19,11 +19,13 @@ Everything here was tested against `valencycol/GTA-VC` with Wrangler 4.127.0 and
      │                  │                   │
   dist/*            /vcsky/*            /saves/*
  (static assets)    /vcbr/*             /token/get
- free, unmetered    proxied to           Workers KV
-                    cdn.dos.zone         (save slots)
+ free, unmetered    your R2 bucket       Workers KV
+                    (game assets)        (save slots)
 ```
 
-The repo's `server.py` and `index.php` only do three jobs: serve `dist/`, proxy two CDN paths, and store save files. The Worker replaces all three. Nothing is compiled — `dist/` ships prebuilt in the repo — so there is no build step at all.
+The repo's `server.py` and `index.php` only do three jobs: serve `dist/`, supply the game assets, and store save files. The Worker replaces all three. Nothing is compiled — `dist/` ships prebuilt in the repo — so there is no build step at all.
+
+**A note on where the assets come from.** Upstream, the project proxies `cdn.dos.zone` for its assets. As of August 2026 those buckets return `AccessDenied` to everyone, including direct requests, because DOS Zone moved to a bring-your-own-files model. This guide therefore hosts the assets in your own R2 bucket from the start. There is no proxy configuration that works around a private bucket.
 
 ---
 
@@ -115,14 +117,11 @@ Create at the repo root. This is the whole server:
 
 ```js
 // gta-vc — replaces server.py / index.php on Cloudflare Workers.
-//   /vcsky/*, /vcbr/*  → proxied to the DOS Zone CDN (game.js expects same-origin paths)
+//   /vcsky/*, /vcbr/*  → game assets from your R2 bucket (game.js expects same-origin paths)
 //   /token/get, /saves/*  → self-hosted saves, backed by Workers KV
 //   everything else     → served from dist/ as a static asset (free, unmetered)
 
-const UPSTREAM = {
-  "/vcsky/": "https://cdn.dos.zone/vcsky/",
-  "/vcbr/": "https://br.cdn.dos.zone/vcsky/",
-};
+const R2_PREFIXES = { "/vcsky/": "vcsky/", "/vcbr/": "vcbr/" };
 
 const MAX_SAVE_BYTES = 4 * 1024 * 1024;
 const safe = (s) => typeof s === "string" && /^[\w.-]{1,64}$/.test(s);
@@ -130,7 +129,7 @@ const safe = (s) => typeof s === "string" && /^[\w.-]{1,64}$/.test(s);
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const { pathname, search } = url;
+    const { pathname } = url;
 
     // --- saves ---------------------------------------------------------
 
@@ -180,12 +179,21 @@ export default {
 
     // --- game assets ---------------------------------------------------
 
-    for (const [prefix, base] of Object.entries(UPSTREAM)) {
+    for (const [prefix, keyBase] of Object.entries(R2_PREFIXES)) {
       if (pathname.startsWith(prefix)) {
-        const target = base + pathname.slice(prefix.length) + search;
-        return fetch(new Request(target, request), {
-          cf: { cacheEverything: true },
-        });
+        const key = keyBase + decodeURIComponent(pathname.slice(prefix.length));
+        if (key.includes("..")) return new Response("bad request", { status: 400 });
+
+        const object = await env.GAME.get(key);
+        if (!object) return new Response("not found", { status: 404 });
+
+        const headers = new Headers();
+        object.writeHttpMetadata(headers);
+        headers.set("etag", object.httpEtag);
+        headers.set("cache-control", "public, max-age=31536000, immutable");
+        if (key.endsWith(".br")) headers.set("content-encoding", "br");
+
+        return new Response(object.body, { headers, encodeBody: "manual" });
       }
     }
 
@@ -194,9 +202,10 @@ export default {
 };
 ```
 
-Two things worth knowing about this file:
+Three things worth knowing about this file:
 
-- The proxy never reads the response body. That's deliberate — it lets the pre-compressed `.br` game data pass through with `Content-Encoding: br` intact. Touching the body causes `ERR_CONTENT_DECODING_FAILED` in the browser.
+- **`encodeBody: "manual"` is load-bearing.** The `vcbr/` objects are stored as raw Brotli. Setting `Content-Encoding: br` without this option makes the Workers runtime compress the body a *second* time, and the browser then fails with `CompileError: WebAssembly.instantiate(): expected magic word`. `manual` tells the runtime the bytes are already encoded and to pass them through untouched.
+- The `.br` suffix decides the header. Files under `vcsky/` are stored decompressed and must not get a `Content-Encoding`, or you hit the same double-decode failure in reverse.
 - The `safe()` guard is not in the original Python. KV keys are flat strings, so without it a token containing a slash could write into another player's namespace.
 
 ### 2.4 `wrangler.toml`
@@ -219,6 +228,10 @@ binding = "ASSETS"
 [[kv_namespaces]]
 binding = "SAVES"
 id = "PASTE_KV_ID_HERE"
+
+[[r2_buckets]]
+binding = "GAME"
+bucket_name = "gta-vc-assets"
 ```
 
 TOML is order-sensitive: `routes` must sit **above** `[assets]` and `[[kv_namespaces]]`, or it gets parsed as part of the table above it.
@@ -287,6 +300,60 @@ npx wrangler kv namespace create SAVES
 It prints a namespace `id`. Paste that into `wrangler.toml` in place of `PASTE_KV_ID_HERE`.
 
 No dashboard clicking and no payment method needed. KV's free tier gives you 1 GB of storage, 100,000 reads and 1,000 writes per day, and a 25 MB ceiling per value. A Vice City save is around 200 KB.
+
+### 3.4 Create the R2 bucket
+
+R2 is the one piece that needs a payment method on file, even for the free tier. You are not charged inside 10 GB of storage, and R2 has no egress fees. There is no alternative for these files: the largest is around 130 MB, which exceeds both the 25 MiB per-file limit on Workers static assets and the 25 MB per-value limit on KV.
+
+Enable R2 in the dashboard under **R2 Object Storage** (it prompts for a card once), then:
+
+```bash
+npx wrangler r2 bucket create gta-vc-assets
+```
+
+### 3.5 Load the game assets into R2
+
+The project ships every asset in one packed archive, independent of any CDN. It is about 1.01 GiB, so start the download before you do anything else.
+
+```bash
+cd ~/GTA-VC
+pip install -r requirements.txt
+python server.py --unpacked https://folder.morgen.qzz.io/revcdos.bin
+```
+
+This streams and unpacks simultaneously into `unpacked/{md5}/`, containing `vcsky/` and `vcbr/` subdirectories, then starts a local server. **Play it at `http://localhost:8000` before going further** — that proves the assets are intact and separates any later problem from the assets themselves. Then `Ctrl-C`.
+
+Note what the unpacker produces, because the Worker depends on it: files under `vcbr/` keep their `.br` extension and stay Brotli-compressed, while everything under `vcsky/` is written out decompressed.
+
+Uploading a few thousand files one at a time with `wrangler r2 object put` would take hours, so use rclone:
+
+```bash
+brew install rclone
+```
+
+rclone talks to R2 over its S3 API, which needs its own credentials — this is the one place in this guide where you create a token by hand. In the dashboard: **R2 → API → Manage API Tokens → Create API token**, permission **Object Read & Write**, scoped to `gta-vc-assets`. You get an Access Key ID, a Secret Access Key, and an endpoint URL.
+
+```bash
+rclone config create r2 s3 \
+  provider=Cloudflare \
+  access_key_id=YOUR_ACCESS_KEY_ID \
+  secret_access_key=YOUR_SECRET_ACCESS_KEY \
+  endpoint=https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com \
+  region=auto \
+  no_check_bucket=true
+
+cd ~/GTA-VC/unpacked/<md5>
+rclone copy . r2:gta-vc-assets/ --progress --transfers 16 --checksum
+```
+
+The `vcsky/` and `vcbr/` directory names become the R2 key prefixes the Worker looks up, so copy the contents of the `{md5}` directory, not the directory itself. Verify when it finishes:
+
+```bash
+npx wrangler r2 object get gta-vc-assets/vcbr/vc-sky-en-v6.wasm.br --file=/tmp/check.br
+ls -lh /tmp/check.br    # tens of MB, not a few hundred bytes
+```
+
+Those rclone credentials are secrets. Keep them out of the repo — `rclone config create` stores them in `~/.config/rclone/rclone.conf`, not in your project.
 
 ---
 
@@ -393,9 +460,10 @@ After deploying, from the Mac:
 # 1. Game page loads
 curl -sI https://gta-vc.colaco.se/ | head -3
 
-# 2. Brotli game data passes through uncompressed-untouched
-curl -sI https://gta-vc.colaco.se/vcbr/vc-sky-en-v6.wasm.br | grep -i 'http\|content-'
-#    expect: 200 + content-encoding: br
+# 2. The wasm decodes to a real wasm, not a double-encoded body
+curl -s --compressed https://gta-vc.colaco.se/vcbr/vc-sky-en-v6.wasm.br -o /tmp/vc.wasm
+ls -lh /tmp/vc.wasm && head -c 4 /tmp/vc.wasm | xxd
+#    expect: tens of MB, and magic word 0061 736d
 
 # 3. Token endpoint answers
 curl -s 'https://gta-vc.colaco.se/token/get?id=valen'
@@ -421,7 +489,7 @@ Then in a browser: load the site, enter a 5-character key, check the status goes
 
 **What counts against your free tier.** Everything in `dist/` is served as a static asset, which Cloudflare bills at zero and doesn't cap. Only `/vcsky/*`, `/vcbr/*`, `/saves/*` and `/token/get` invoke the Worker, against 100,000 requests/day. The game caches streamed assets in IndexedDB and the 130 MB payload in the Cache API, so a returning player costs almost nothing. KV's 1,000 writes/day is the other ceiling — that's 1,000 in-game saves across all players per day.
 
-**The bandwidth terms.** Cloudflare's Service-Specific Terms restrict using the CDN to serve large files hosted *outside* Cloudflare without a paid Developer Platform service. Proxying a 130 MB payload from dos.zone is exactly that shape. It won't matter for you and a few friends. If this ever gets real traffic, move the assets into R2 (see appendix) — Cloudflare explicitly permits large files served from their own storage, with no egress fees.
+**The bandwidth terms, which you are already on the right side of.** Cloudflare's Service-Specific Terms restrict serving large files hosted *outside* Cloudflare through the CDN without a paid Developer Platform service. Because the assets live in your own R2 bucket, that restriction does not apply — Cloudflare explicitly permits large files served from their own storage, and R2 has no egress fees. R2 reads do count as Class B operations against the free 10 million per month, which a personal site will not approach.
 
 **Access control.** The game data is Rockstar's, and a public `gta-vc.colaco.se` distributes it. If you'd rather keep it private, put Cloudflare Access in front of the Worker (**Zero Trust → Access → Applications**, free for small teams). That also fixes the guessable-save-key problem in one move.
 
@@ -436,7 +504,10 @@ Then in a browser: load the site, enter a 5-character key, check the status goes
 | Custom domain stuck initializing | Conflicting DNS record for `gta-vc` | Delete it in the DNS dashboard, redeploy |
 | `Unexpected fields found in kv_namespaces[0]` | `routes` placed after a table header in TOML | Move `routes` above `[assets]` |
 | Wrangler refuses to start | Node below 22 | `brew upgrade node` or `nvm use 22` |
-| Game loads but assets 404 | Upstream CDN unreachable | `curl -I https://cdn.dos.zone/vcsky/sha256sums.txt` |
+| `expected magic word 00 61 73 6d, found 3c 3f 78 6d` | An XML error page is being served as game data | `curl -s <your-domain>/vcbr/vc-sky-en-v6.wasm.br \| head -c 400` — the `<Code>` names the cause |
+| Same error, but the body is not XML | Body double-encoded | Confirm `encodeBody: "manual"` is on the R2 response |
+| Assets 404 through the Worker | Wrong key prefixes in the bucket | `npx wrangler r2 object get gta-vc-assets/vcsky/sha256sums.txt --file=-` |
+| Fixed the server, still broken in the browser | Corrupt payload cached by `loadData()` | Private window, or Application → Storage → Clear site data |
 | Saves don't sync across devices | No key entered, or different key | Same 5 characters on both, status green |
 | `Authentication error [code: 10000]` locally | OAuth credentials expired or revoked | `npx wrangler logout` then `npx wrangler login` |
 | Deployed to the wrong Cloudflare account | Logged in as a different account | `npx wrangler whoami`, then re-login |
@@ -444,21 +515,17 @@ Then in a browser: load the site, enter a 5-character key, check the status goes
 
 ---
 
-## Appendix A: moving the assets to R2
+## Appendix A: refreshing or re-packing the assets
 
-Only needed if the site gets real traffic. R2 requires a payment method on file even for the free tier (10 GB storage, no egress fees), which is why it isn't the default here.
+If the asset set is ever updated, or you want to rebuild your bucket from scratch:
 
-1. Pull the assets locally: `python server.py --unpacked https://folder.morgen.qzz.io/revcdos.bin` produces `unpacked/{hash}/vcsky/` and `vcbr/`
-2. `npx wrangler r2 bucket create gta-vc-assets`, then upload both trees
-3. Add the binding to `wrangler.toml`:
-   ```toml
-   [[r2_buckets]]
-   binding = "GAME"
-   bucket_name = "gta-vc-assets"
-   ```
-4. Replace the `UPSTREAM` loop with an R2 lookup keyed on the same paths, and set `content-encoding: br` yourself for `.br` keys — R2 stores raw bytes and won't infer it
+1. Re-run `python server.py --unpacked <archive-url-or-file>` to get a fresh `unpacked/{md5}/` tree
+2. `rclone sync` (not `copy`) that directory into the bucket to remove files that no longer exist
+3. Redeploy is not required — the Worker reads whatever is in the bucket at request time
 
-That drops the dependency on dos.zone entirely and puts you inside the terms with room to spare.
+`utils/packer_brotli.py` also runs in reverse: `python server.py --pack unpacked/<md5>` builds a `.bin` archive from a directory, which is a convenient way to keep your own backup of the asset set on external storage.
+
+Because the Worker sends `cache-control: public, max-age=31536000, immutable`, replacing a file under the same name will not reach players who already cached it. Purge the Cloudflare cache for the zone after any asset change, and remember that `loadData()` also keeps a copy in each browser's Cache API.
 
 ---
 

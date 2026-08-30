@@ -9,6 +9,7 @@ routes = [
 [assets]
 directory = "./dist"
 binding = "ASSETS"
+run_worker_first = true
 
 [[kv_namespaces]]
 binding = "SAVES"
@@ -17,3 +18,4 @@ id = "4c7cc128ecdc43b185c678bc80a07c02"
 [[r2_buckets]]
 binding = "GAME"
 bucket_name = "gta-vc-assets"
+

@@ -458,3 +458,18 @@ There are two layers, and the first works whether or not you do anything.
 Red status saying *disabled* means the Worker isn't answering `/token/get` — see troubleshooting.
 
 That five-character key is the only thing protecting a save slot. Anyone who guesses it can read or overwrite that save. 
+
+## 8. Securing the Cloudflare Worker
+
+By default everything is public: the landing page, the ~1.6 GB of game assets in R2, and /saves/*, where a save slot is protected only by a guessable five-character key. This section closes all of that with one gate. Set your credentials as Worker secrets and deploy:
+
+```bash
+npx wrangler secret put AUTH_EMAIL
+npx wrangler secret put AUTH_PASSWORD
+npx wrangler secret list      # expect exactly AUTH_EMAIL and AUTH_PASSWORD
+npm run deploy
+```
+
+The argument is the secret's **name** — the value is typed at the prompt that follows.
+
+

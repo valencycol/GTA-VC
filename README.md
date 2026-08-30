@@ -455,7 +455,7 @@ There are two layers, and the first works whether or not you do anything.
 3. From then on, every in-game save also pushes `vcsky.saves` to KV under `valen/vcsky.saves`
 4. Entering the same five characters on your phone, or on any other browser, pulls that save back
 
-Red status saying *disabled* means the Worker isn't answering `/token/get` — see troubleshooting.
+Red status saying *disabled* means the Worker isn't answering `/token/get`. 
 
 That five-character key is the only thing protecting a save slot. Anyone who guesses it can read or overwrite that save. 
 
